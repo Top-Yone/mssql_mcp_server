@@ -2,10 +2,19 @@ import asyncio
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
+from typing import Literal, cast
+
 import pymssql
 from mcp.server import Server
+from mcp.server.sse import SseServerTransport
 from mcp.types import Resource, Tool, TextContent
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import AnyUrl
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Mount, Route
 
 # Configure logging
 logging.basicConfig(
@@ -13,6 +22,66 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("mssql_mcp_server")
+
+SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+TRANSPORT_ALIASES = {
+    "http": "streamable-http",
+    "streamable_http": "streamable-http",
+    "streamablehttp": "streamable-http",
+}
+
+
+def _normalize_http_path(path: str, env_name: str) -> str:
+    """Normalize an HTTP path and validate basic format."""
+    path = path.strip()
+    if not path:
+        raise ValueError(f"{env_name} cannot be empty")
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    return path
+
+
+def get_transport() -> Literal["stdio", "sse", "streamable-http"]:
+    """Get MCP transport mode from environment variables."""
+    raw_transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
+    normalized_transport = TRANSPORT_ALIASES.get(raw_transport, raw_transport)
+
+    if normalized_transport not in SUPPORTED_TRANSPORTS:
+        raise ValueError(
+            "Invalid MCP_TRANSPORT value: "
+            f"{raw_transport}. Supported values: stdio, sse, streamable-http"
+        )
+
+    return cast(Literal["stdio", "sse", "streamable-http"], normalized_transport)
+
+
+def get_http_config():
+    """Get HTTP server configuration from environment variables."""
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port_raw = os.getenv("MCP_PORT", "8000")
+    log_level = os.getenv("MCP_LOG_LEVEL", "info").lower()
+
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid MCP_PORT value: {port_raw}") from exc
+
+    config = {
+        "host": host,
+        "port": port,
+        "log_level": log_level,
+        "mcp_path": _normalize_http_path(os.getenv("MCP_PATH", "/mcp"), "MCP_PATH"),
+        "sse_path": _normalize_http_path(os.getenv("MCP_SSE_PATH", "/sse"), "MCP_SSE_PATH"),
+        "message_path": _normalize_http_path(
+            os.getenv("MCP_MESSAGE_PATH", "/messages"),
+            "MCP_MESSAGE_PATH",
+        ),
+        "stateless_http": os.getenv("MCP_STATELESS_HTTP", "false").strip().lower() == "true",
+    }
+
+    return config
 
 def validate_table_name(table_name: str) -> str:
     """Validate and escape table name to prevent SQL injection."""
@@ -266,17 +335,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def main():
     """Main entry point to run the MCP server."""
-    from mcp.server.stdio import stdio_server
-    
     logger.info("Starting MSSQL MCP server...")
     config = get_db_config()
+    transport = get_transport()
     # Log connection info without exposing sensitive data
     server_info = config['server']
     if 'port' in config:
         server_info += f":{config['port']}"
     user_info = config.get('user', 'Windows Auth')
     logger.info(f"Database config: {server_info}/{config['database']} as {user_info}")
-    
+    logger.info(f"Using MCP transport: {transport}")
+
+    if transport == "stdio":
+        await run_stdio_server()
+    else:
+        await run_http_server(transport)
+
+
+async def run_stdio_server():
+    """Run MCP server over stdio transport."""
+    from mcp.server.stdio import stdio_server
+
     async with stdio_server() as (read_stream, write_stream):
         try:
             await app.run(
@@ -287,6 +366,92 @@ async def main():
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
             raise
+
+
+def create_sse_app() -> Starlette:
+    """Create a Starlette app for SSE transport."""
+    http_config = get_http_config()
+    sse_transport = SseServerTransport(http_config["message_path"])
+
+    async def handle_sse(request: Request) -> Response:
+        async with sse_transport.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,  # type: ignore[attr-defined]
+        ) as streams:
+            await app.run(
+                streams[0],
+                streams[1],
+                app.create_initialization_options(),
+            )
+        return Response()
+
+    routes = [
+        Route(http_config["sse_path"], endpoint=handle_sse, methods=["GET"]),
+        Mount(http_config["message_path"], app=sse_transport.handle_post_message),
+    ]
+    return Starlette(routes=routes)
+
+
+def create_streamable_http_app() -> Starlette:
+    """Create a Starlette app for Streamable HTTP transport."""
+    http_config = get_http_config()
+    session_manager = StreamableHTTPSessionManager(
+        app=app,
+        stateless=http_config["stateless_http"],
+    )
+
+    class StreamableHTTPASGIApp:
+        """Small ASGI adapter for session manager request handling."""
+
+        def __init__(self, manager: StreamableHTTPSessionManager):
+            self.manager = manager
+
+        async def __call__(self, scope, receive, send) -> None:
+            await self.manager.handle_request(scope, receive, send)
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette):
+        async with session_manager.run():
+            yield
+
+    routes = [
+        Route(http_config["mcp_path"], endpoint=StreamableHTTPASGIApp(session_manager)),
+    ]
+    return Starlette(routes=routes, lifespan=lifespan)
+
+
+async def run_http_server(transport: Literal["sse", "streamable-http"]):
+    """Run MCP server over HTTP transport."""
+    import uvicorn
+
+    http_config = get_http_config()
+    if transport == "sse":
+        starlette_app = create_sse_app()
+        logger.info(
+            "Starting SSE MCP server at http://%s:%d%s (message endpoint: %s)",
+            http_config["host"],
+            http_config["port"],
+            http_config["sse_path"],
+            http_config["message_path"],
+        )
+    else:
+        starlette_app = create_streamable_http_app()
+        logger.info(
+            "Starting Streamable HTTP MCP server at http://%s:%d%s",
+            http_config["host"],
+            http_config["port"],
+            http_config["mcp_path"],
+        )
+
+    uvicorn_config = uvicorn.Config(
+        starlette_app,
+        host=http_config["host"],
+        port=http_config["port"],
+        log_level=http_config["log_level"],
+    )
+    server = uvicorn.Server(uvicorn_config)
+    await server.serve()
 
 if __name__ == "__main__":
     asyncio.run(main())

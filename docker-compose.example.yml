@@ -10,10 +10,16 @@ services:
       - MSSQL_PASSWORD=YourStrong@Passw0rd
       - MSSQL_PORT=1433
       - MSSQL_ENCRYPT=false
+      - MCP_TRANSPORT=streamable-http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - MCP_PATH=/mcp
     depends_on:
       - sqlserver
     stdin_open: true
     tty: true
+    ports:
+      - "8000:8000"
 
   # Example SQL Server for testing
   sqlserver:

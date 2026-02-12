@@ -42,6 +42,20 @@ Add to your `claude_desktop_config.json`:
 
 ## Configuration
 
+### MCP Transport
+```bash
+MCP_TRANSPORT=stdio            # stdio (default), sse, streamable-http
+MCP_HOST=127.0.0.1             # HTTP bind host (HTTP transports only)
+MCP_PORT=8000                  # HTTP bind port (HTTP transports only)
+MCP_PATH=/mcp                  # Streamable HTTP endpoint path
+MCP_SSE_PATH=/sse              # SSE endpoint path (SSE transport only)
+MCP_MESSAGE_PATH=/messages     # SSE message POST path (SSE transport only)
+MCP_STATELESS_HTTP=false       # Optional streamable-http stateless mode
+```
+
+When `MCP_TRANSPORT=streamable-http`, the MCP endpoint is:
+`http://<MCP_HOST>:<MCP_PORT><MCP_PATH>` (for example `http://127.0.0.1:8000/mcp`).
+
 ### Basic SQL Authentication
 ```bash
 MSSQL_SERVER=localhost          # Required
@@ -97,6 +111,15 @@ Then in `claude_desktop_config.json`:
 git clone https://github.com/RichardHan/mssql_mcp_server.git
 cd mssql_mcp_server
 pip install -e .
+```
+
+### Run with HTTP Transport
+```bash
+MCP_TRANSPORT=streamable-http \
+MCP_HOST=0.0.0.0 \
+MCP_PORT=8000 \
+MCP_PATH=/mcp \
+python -m mssql_mcp_server
 ```
 
 ## Security
